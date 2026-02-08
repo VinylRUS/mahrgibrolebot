@@ -1,0 +1,5 @@
+# Requirements for the Discord Role Bot
+# discord.py is required (2.x series). python-dotenv is optional but convenient for local development.
+
+discord.py>=2.3.3
+python-dotenv>=1.0.0
