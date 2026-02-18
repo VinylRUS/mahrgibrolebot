@@ -1,4 +1,12 @@
-# role_bot_slash_persistent.py
+# role_bot_slash_fixed.py
+"""
+Discord self-role bot with persistent select menus (fixed labels).
+Requirements: python 3.11+, discord.py 2.3+
+ENV:
+  DISCORD_BOT_TOKEN - required
+  GUILD_ID - optional (for fast guild command sync during testing)
+"""
+
 import os
 import json
 import logging
@@ -8,34 +16,36 @@ from uuid import uuid4
 
 import discord
 from discord import app_commands
-from discord.ext import commands
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("role-bot")
+# ----------------- Logging -----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("role_bot")
 
-# --------- CONFIG & HELPERS ----------
+# ----------------- Config -----------------
 DATA_FILE = Path("config.json")
 
 
-def load_data():
+def load_data() -> dict:
     if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        try:
+            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            log.exception("Не удалось прочитать config.json — загружаю пустой конфиг.")
     return {"join_role_id": None, "role_messages": []}
 
 
-def save_data(d):
+def save_data(d: dict) -> None:
     DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 data = load_data()
 
-# optional quick guild sync - set GUILD_ID env to test fast
+# ----------------- Intents & client -----------------
 GUILD_ID = os.environ.get("GUILD_ID")
-GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+TEST_GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
-# ---------- INTENTS & CLIENT ----------
 intents = discord.Intents.default()
-intents.members = True  # needed for on_member_join and roles
+intents.members = True
 intents.guilds = True
 
 class RoleClient(discord.Client):
@@ -44,37 +54,37 @@ class RoleClient(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # Restore persistent views for saved messages
+        # Восстановление сохранённых persistent views
         for item in data.get("role_messages", []):
             try:
                 guild = self.get_guild(item["guild_id"])
                 if guild is None:
-                    log.warning("Guild %s not in cache; skipping view restore.", item["guild_id"])
+                    log.warning("Guild %s not in cache; skipping restore for message %s", item["guild_id"], item["message_id"])
                     continue
                 channel = guild.get_channel(item["channel_id"])
                 if channel is None:
-                    log.warning("Channel %s not in cache; skipping.", item["channel_id"])
+                    log.warning("Channel %s not in cache; skipping restore for message %s", item["channel_id"], item["message_id"])
                     continue
-                # fetch message to ensure it exists
+                # Убедимся, что сообщение существует
                 message = await channel.fetch_message(item["message_id"])
-                # build view and register
+                # Разрешаем роли, существующие в гильдии
                 roles = [guild.get_role(rid) for rid in item["role_ids"]]
                 roles = [r for r in roles if r is not None]
                 if not roles:
-                    log.warning("No roles found for saved message %s; skipping.", item["message_id"])
+                    log.warning("No roles available for saved message %s; skipping.", item["message_id"])
                     continue
-                view = SelectView(uid=item["uid"], role_ids=[r.id for r in roles])
+                view = SelectView(uid=item["uid"], guild=guild, role_ids=[r.id for r in roles])
                 self.add_view(view, message_id=message.id)
-                log.info("Restored view uid=%s for message %s (guild %s)", item["uid"], message.id, guild.id)
+                log.info("Restored view uid=%s for message %s in guild %s", item["uid"], message.id, guild.id)
             except Exception as e:
                 log.exception("Error restoring view for item %s: %s", item, e)
 
-        # sync commands (guild if provided for fast testing)
+        # Sync slash commands (guild if provided for quick testing)
         try:
-            if GUILD:
-                self.tree.copy_global_to(guild=GUILD)
-                await self.tree.sync(guild=GUILD)
-                log.info("Synced commands to guild %s", GUILD_ID)
+            if TEST_GUILD:
+                self.tree.copy_global_to(guild=TEST_GUILD)
+                await self.tree.sync(guild=TEST_GUILD)
+                log.info("Synced commands to test guild %s", GUILD_ID)
             else:
                 await self.tree.sync()
                 log.info("Synced global commands")
@@ -84,34 +94,55 @@ class RoleClient(discord.Client):
 
 bot = RoleClient()
 
-# ---------- Utility checks ----------
+# ----------------- Utilities -----------------
 def has_manage_roles(interaction: discord.Interaction) -> bool:
+    # interaction.user в гильдии — Member
     if not interaction.guild:
         return False
     member = interaction.guild.get_member(interaction.user.id)
-    if member is None:
-        return False
+    if not member:
+        # fallback: interaction.user may already be a Member in many cases
+        try:
+            member = await interaction.guild.fetch_member(interaction.user.id)  # type: ignore
+        except Exception:
+            return False
     return member.guild_permissions.manage_roles or member.guild_permissions.administrator
 
 async def ensure_role_assignable(guild: discord.Guild, role: discord.Role):
+    # Проверяет, может ли бот выдать роль (Manage Roles + позиция роли ниже роли бота)
     me = guild.me or await guild.fetch_member(bot.user.id)
     if not me.guild_permissions.manage_roles:
-        raise RuntimeError("У бота нет права Manage Roles.")
+        raise RuntimeError("У бота нет права Manage Roles в этой гильдии.")
     if role.position >= me.top_role.position:
-        raise RuntimeError("Роль выше роли бота — поставьте роль бота повыше.")
+        raise RuntimeError("Роль находится выше роли бота — передвинь роль бота выше.")
     return True
 
-# ---------- Persistent Select & View ----------
+# ----------------- Persistent select & view -----------------
 class RoleSelect(discord.ui.Select):
-    def __init__(self, uid: str, role_ids: List[int]):
+    def __init__(self, uid: str, guild: discord.Guild, role_ids: List[int]):
+        """
+        uid: unique id for this menu (used in custom_id)
+        guild: guild object used to resolve role names for labels
+        role_ids: list of role IDs included in this select
+        """
         self.uid = uid
         self.role_ids = role_ids
-        options = []
-        # labels will be updated per-guild when callback runs (roles resolved)
+
+        options: List[discord.SelectOption] = []
         for rid in role_ids:
-            options.append(discord.SelectOption(label=str(rid), value=str(rid)))
+            role = guild.get_role(rid)
+            if role:
+                label = role.name
+                # Truncate label if too long for select option (80 chars limit); safe-guard
+                if len(label) > 80:
+                    label = label[:77] + "..."
+                options.append(discord.SelectOption(label=label, value=str(role.id)))
+        # If no options (e.g. roles deleted) we still create a minimal option to avoid errors
+        if not options:
+            options = [discord.SelectOption(label="(нет доступных ролей)", value="0")]
+
         super().__init__(
-            placeholder="Выберите роли (подтвердите выбор)",
+            placeholder="Выберите роли (отметьте все, которые хотите оставить)",
             min_values=0,
             max_values=len(options),
             options=options,
@@ -119,67 +150,64 @@ class RoleSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        # Defer response to ensure we acknowledge quickly
+        await interaction.response.defer(ephemeral=True)
+
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
+            await interaction.followup.send("Команда доступна только на сервере.", ephemeral=True)
             return
+        member = interaction.user  # Member
 
-        member = interaction.user
-        # Resolve roles from guild
-        roles = [guild.get_role(int(rid)) for rid in self.role_ids]
+        # Resolve roles (filter out deleted)
+        roles = [guild.get_role(int(opt.value)) for opt in self.options if opt.value != "0"]
         roles = [r for r in roles if r is not None]
+
         if not roles:
-            await interaction.response.send_message("Роли для этого меню не найдены (возможно удалены).", ephemeral=True)
+            await interaction.followup.send("Роли для этого меню не найдены (возможно удалены). Обратитесь к админам.", ephemeral=True)
             return
 
-        # Update options labels to actual role names (in case they were numeric)
-        for opt in self.options:
-            try:
-                r = guild.get_role(int(opt.value))
-                opt.label = r.name if r else opt.label
-            except Exception:
-                pass
-
-        # Check assignability
+        # Ensure assignable roles
         for r in roles:
             try:
                 await ensure_role_assignable(guild, r)
             except RuntimeError as e:
-                await interaction.response.send_message(f"Невозможно изменить роль **{r.name}**: {e}", ephemeral=True)
+                await interaction.followup.send(f"Невозможно изменить роль **{r.name}**: {e}", ephemeral=True)
                 return
 
-        selected_ids = set(int(v) for v in self.values)
+        selected_ids = set(int(v) for v in self.values if v.isdigit())
+
         to_add = [r for r in roles if r.id in selected_ids and r not in member.roles]
         to_remove = [r for r in roles if r.id not in selected_ids and r in member.roles]
 
-        msg_parts = []
+        parts = []
         try:
             if to_add:
                 await member.add_roles(*to_add, reason="Self-select via select menu")
-                msg_parts.append(f"Выданы: {', '.join(r.name for r in to_add)}")
+                parts.append("Выданы: " + ", ".join(r.name for r in to_add))
             if to_remove:
                 await member.remove_roles(*to_remove, reason="Self-select via select menu")
-                msg_parts.append(f"Сняты: {', '.join(r.name for r in to_remove)}")
-            if not msg_parts:
-                await interaction.response.send_message("Нет изменений в ролях.", ephemeral=True)
+                parts.append("Сняты: " + ", ".join(r.name for r in to_remove))
+            if not parts:
+                await interaction.followup.send("Нет изменений в ролях.", ephemeral=True)
             else:
-                await interaction.response.send_message("; ".join(msg_parts), ephemeral=True)
+                await interaction.followup.send("; ".join(parts), ephemeral=True)
         except discord.Forbidden:
-            await interaction.response.send_message("У меня нет прав менять эти роли.", ephemeral=True)
+            await interaction.followup.send("У меня нет прав менять эти роли (Forbidden).", ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"Ошибка: {e}", ephemeral=True)
+            await interaction.followup.send(f"Ошибка при изменении ролей: {e}", ephemeral=True)
 
 class SelectView(discord.ui.View):
-    def __init__(self, uid: str, role_ids: List[int]):
+    def __init__(self, uid: str, guild: discord.Guild, role_ids: List[int]):
         super().__init__(timeout=None)
         self.uid = uid
         self.role_ids = role_ids
-        self.add_item(RoleSelect(uid=uid, role_ids=role_ids))
+        self.add_item(RoleSelect(uid=uid, guild=guild, role_ids=role_ids))
 
-# ---------- Events ----------
+# ----------------- Events -----------------
 @bot.event
 async def on_ready():
-    log.info(f"Logged in as {bot.user} (id={bot.user.id})")
+    log.info("Bot ready: %s (id=%s)", bot.user, bot.user.id)
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -194,36 +222,62 @@ async def on_member_join(member: discord.Member):
             except Exception as e:
                 log.warning("Failed to assign join role: %s", e)
 
-# ---------- Slash commands ----------
+# ----------------- Slash commands -----------------
+# Helpers for permission responses
+async def require_manage(interaction: discord.Interaction) -> bool:
+    if not interaction.guild:
+        await interaction.response.send_message("Команда доступна только на сервере.", ephemeral=True)
+        return False
+    member = interaction.guild.get_member(interaction.user.id)
+    if member is None:
+        # fallback: try fetch
+        try:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+        except Exception:
+            await interaction.response.send_message("Не удалось определить ваши права.", ephemeral=True)
+            return False
+    if not (member.guild_permissions.manage_roles or member.guild_permissions.administrator):
+        await interaction.response.send_message("Нужны права Manage Roles или Administrator.", ephemeral=True)
+        return False
+    return True
+
 @bot.tree.command(name="setjoinrole", description="Установить роль, выдаваемую при заходе")
-@app_commands.describe(role="Роль для авто-выдачи")
+@app_commands.describe(role="Роль, которая будет выдаваться при заходе")
 async def setjoinrole(interaction: discord.Interaction, role: discord.Role):
-    if not has_manage_roles(interaction):
-        await interaction.response.send_message("Нужны права Manage Roles/Administrator.", ephemeral=True)
+    if not await require_manage(interaction):
         return
     try:
         await ensure_role_assignable(interaction.guild, role)
     except Exception as e:
-        await interaction.response.send_message(f"Невозможно установить эту роль: {e}", ephemeral=True)
+        await interaction.response.send_message(f"Невозможно установить роль: {e}", ephemeral=True)
         return
     data["join_role_id"] = role.id
     save_data(data)
     await interaction.response.send_message(f"Роль при заходе установлена: **{role.name}**", ephemeral=True)
 
-@bot.tree.command(name="clearjoinrole", description="Сбросить роль при заходе")
+@bot.tree.command(name="clearjoinrole", description="Очистить роль при заходе")
 async def clearjoinrole(interaction: discord.Interaction):
-    if not has_manage_roles(interaction):
-        await interaction.response.send_message("Нужны права Manage Roles/Administrator.", ephemeral=True)
+    if not await require_manage(interaction):
         return
     data["join_role_id"] = None
     save_data(data)
     await interaction.response.send_message("Роль при заходе очищена.", ephemeral=True)
 
-# /createrolemsg channel title role1..role10
 @bot.tree.command(name="createrolemsg", description="Создать сообщение с select-menu для самоназначения ролей (до 10 ролей)")
-@app_commands.describe(channel="Канал для сообщения", title="Заголовок embed (кратко)", 
-                       role1="Роль 1 (обязательно)", role2="Роль 2 (опционально)", role3="Роль 3",
-                       role4="Роль 4", role5="Роль 5", role6="Роль 6", role7="Роль 7", role8="Роль 8", role9="Роль 9", role10="Роль 10")
+@app_commands.describe(
+    channel="Канал для сообщения",
+    title="Заголовок embed",
+    role1="Роль 1 (обязательно)",
+    role2="Роль 2 (опционально)",
+    role3="Роль 3",
+    role4="Роль 4",
+    role5="Роль 5",
+    role6="Роль 6",
+    role7="Роль 7",
+    role8="Роль 8",
+    role9="Роль 9",
+    role10="Роль 10"
+)
 async def createrolemsg(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
@@ -239,16 +293,15 @@ async def createrolemsg(
     role9: Optional[discord.Role] = None,
     role10: Optional[discord.Role] = None
 ):
-    if not has_manage_roles(interaction):
-        await interaction.response.send_message("Нужны права Manage Roles/Administrator.", ephemeral=True)
+    if not await require_manage(interaction):
         return
 
-    roles = [r for r in [role1, role2, role3, role4, role5, role6, role7, role8, role9, role10] if r is not None]
+    roles = [r for r in (role1, role2, role3, role4, role5, role6, role7, role8, role9, role10) if r is not None]
     if not roles:
         await interaction.response.send_message("Нужно указать хотя бы одну роль.", ephemeral=True)
         return
 
-    # check assignable for each
+    # Check assignable
     for r in roles:
         try:
             await ensure_role_assignable(interaction.guild, r)
@@ -256,15 +309,14 @@ async def createrolemsg(
             await interaction.response.send_message(f"Невозможно использовать роль **{r.name}**: {e}", ephemeral=True)
             return
 
-    # Generate unique uid for this menu (used for custom_id)
-    uid = uuid4().hex
     role_ids = [r.id for r in roles]
+    uid = uuid4().hex
 
     embed = discord.Embed(title=title, description="Выберите роли из меню ниже. Отметьте все, которые хотите оставить.", color=discord.Color.blurple())
-    view = SelectView(uid=uid, role_ids=role_ids)
+    view = SelectView(uid=uid, guild=interaction.guild, role_ids=role_ids)
     message = await channel.send(embed=embed, view=view)
 
-    # persist: save guild_id, channel_id, message_id, role_ids, uid
+    # persist
     data.setdefault("role_messages", []).append({
         "guild_id": interaction.guild.id,
         "channel_id": channel.id,
@@ -275,15 +327,14 @@ async def createrolemsg(
     })
     save_data(data)
 
-    # register persistent view for runtime (also necessary if bot is not restarted)
+    # register view at runtime so it works immediately
     bot.add_view(view, message_id=message.id)
 
     await interaction.response.send_message(f"Создано сообщение с меню в {channel.mention} (id={message.id}).", ephemeral=True)
 
 @bot.tree.command(name="listrolemessages", description="Показать сохранённые сообщения self-role на сервере")
 async def listrolemessages(interaction: discord.Interaction):
-    if not has_manage_roles(interaction):
-        await interaction.response.send_message("Нужны права Manage Roles/Administrator.", ephemeral=True)
+    if not await require_manage(interaction):
         return
     items = [it for it in data.get("role_messages", []) if it["guild_id"] == interaction.guild.id]
     if not items:
@@ -298,8 +349,7 @@ async def listrolemessages(interaction: discord.Interaction):
 @bot.tree.command(name="removerolemsg", description="Удалить запись о сообщении с меню (не удаляет само сообщение в Discord)")
 @app_commands.describe(message_id="ID сообщения для удаления из конфигурации")
 async def removerolemsg(interaction: discord.Interaction, message_id: int):
-    if not has_manage_roles(interaction):
-        await interaction.response.send_message("Нужны права Manage Roles/Administrator.", ephemeral=True)
+    if not await require_manage(interaction):
         return
     before = len(data.get("role_messages", []))
     data["role_messages"] = [it for it in data.get("role_messages", []) if not (it["guild_id"] == interaction.guild.id and it["message_id"] == message_id)]
@@ -313,8 +363,7 @@ async def removerolemsg(interaction: discord.Interaction, message_id: int):
 @bot.tree.command(name="reattachview", description="Попытаться вручную восстановить view для message_id из конфига")
 @app_commands.describe(message_id="ID сообщения из конфига")
 async def reattachview(interaction: discord.Interaction, message_id: int):
-    if not has_manage_roles(interaction):
-        await interaction.response.send_message("Нужны права Manage Roles/Administrator.", ephemeral=True)
+    if not await require_manage(interaction):
         return
     items = [it for it in data.get("role_messages", []) if it["guild_id"] == interaction.guild.id and it["message_id"] == message_id]
     if not items:
@@ -333,17 +382,16 @@ async def reattachview(interaction: discord.Interaction, message_id: int):
         if not roles:
             await interaction.response.send_message("Роли не найдены в гильдии — восстановление невозможно.", ephemeral=True)
             return
-        view = SelectView(uid=it["uid"], role_ids=[r.id for r in roles])
+        view = SelectView(uid=it["uid"], guild=guild, role_ids=[r.id for r in roles])
         bot.add_view(view, message_id=message.id)
         await interaction.response.send_message("View успешно добавлен к сообщению.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Ошибка при попытке восстановить view: {e}", ephemeral=True)
 
-
-# ---------- Run ----------
+# ----------------- Run -----------------
 if __name__ == "__main__":
     TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
     if not TOKEN:
-        print("Установи переменную окружения DISCORD_BOT_TOKEN с токеном бота.")
+        log.error("Установите переменную окружения DISCORD_BOT_TOKEN с токеном бота.")
         raise SystemExit(1)
     bot.run(TOKEN)
