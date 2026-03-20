@@ -54,17 +54,41 @@ class RoleClient(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
+    async def resolve_guild(self, guild_id: int) -> Optional[discord.Guild]:
+        guild = self.get_guild(guild_id)
+        if guild is not None:
+            return guild
+        try:
+            return await self.fetch_guild(guild_id)
+        except discord.DiscordException:
+            log.exception("Failed to fetch guild %s while restoring persistent views", guild_id)
+            return None
+
+    async def resolve_channel(self, guild: discord.Guild, channel_id: int) -> Optional[discord.abc.GuildChannel]:
+        channel = guild.get_channel(channel_id)
+        if channel is not None:
+            return channel
+        try:
+            fetched_channel = await self.fetch_channel(channel_id)
+        except discord.DiscordException:
+            log.exception("Failed to fetch channel %s while restoring persistent views", channel_id)
+            return None
+        if isinstance(fetched_channel, discord.abc.GuildChannel):
+            return fetched_channel
+        log.warning("Channel %s is not a guild channel; skipping persistent view restore", channel_id)
+        return None
+
     async def setup_hook(self):
         # Restore persistent views from saved config
         for item in data.get("role_messages", []):
             try:
-                guild = self.get_guild(item["guild_id"])
+                guild = await self.resolve_guild(item["guild_id"])
                 if guild is None:
-                    log.warning("Guild %s not in client cache; skipping restore for message %s", item["guild_id"], item["message_id"])
+                    log.warning("Guild %s unavailable; skipping restore for message %s", item["guild_id"], item["message_id"])
                     continue
-                channel = guild.get_channel(item["channel_id"])
+                channel = await self.resolve_channel(guild, item["channel_id"])
                 if channel is None:
-                    log.warning("Channel %s not in cache; skipping restore for message %s", item["channel_id"], item["message_id"])
+                    log.warning("Channel %s unavailable; skipping restore for message %s", item["channel_id"], item["message_id"])
                     continue
                 # Ensure message exists
                 message = await channel.fetch_message(item["message_id"])
@@ -358,8 +382,15 @@ async def reattachview(interaction: discord.Interaction, message_id: int):
         guild = interaction.guild
         channel = guild.get_channel(it["channel_id"])
         if channel is None:
-            await interaction.response.send_message("Канал не найден в кеше бота.", ephemeral=True)
-            return
+            try:
+                fetched_channel = await bot.fetch_channel(it["channel_id"])
+            except discord.DiscordException as e:
+                await interaction.response.send_message(f"Не удалось получить канал: {e}", ephemeral=True)
+                return
+            if not isinstance(fetched_channel, discord.abc.GuildChannel):
+                await interaction.response.send_message("Указанный канал не относится к серверу.", ephemeral=True)
+                return
+            channel = fetched_channel
         message = await channel.fetch_message(it["message_id"])
         roles = [guild.get_role(rid) for rid in it["role_ids"]]
         roles = [r for r in roles if r is not None]
